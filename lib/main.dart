@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'screens/music_player_screen.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized(); // <-- Add this line
   runApp(MyApp());
 }
 

@@ -10,17 +10,28 @@ import 'package:path_provider/path_provider.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 
-
 class AudioProcessor {
   final int sampleRate;
   final int fftSize;
   bool _processing = false;
-  bool _stopRequested = false; // NEW
+  bool _stopRequested = false;
+
+  final StreamController<List<double>> bandStreamController = StreamController.broadcast();
+  Stream<List<double>> get bandStream => bandStreamController.stream;
+
+  final StreamController<String> debugStreamController = StreamController.broadcast();
+  Stream<String> get debugStream => debugStreamController.stream;
 
   AudioProcessor({this.sampleRate = 44100, this.fftSize = 1024});
 
   void stopProcessing() {
     _stopRequested = true;
+    bandStreamController.close();
+    debugStreamController.close();
+  }
+
+  void _sendDebug(String msg) {
+    debugStreamController.add(msg);
   }
 
   Future<void> processFileAndPrintBands(String inputPath) async {
@@ -29,14 +40,25 @@ class AudioProcessor {
     _stopRequested = false;
 
     try {
+      _sendDebug('Decoding file to WAV...');
       final outFile = await _decodeToWav(inputPath);
-      if (outFile == null) return;
+      if (outFile == null) {
+        _sendDebug('Failed to decode file.');
+        return;
+      }
+      _sendDebug('Processing WAV file...');
       await _processWavFile(outFile);
-      try { await outFile.delete(); } catch (_) {}
+      try {
+        await outFile.delete();
+        _sendDebug('Temporary WAV file deleted.');
+      } catch (_) {
+        _sendDebug('Failed to delete temporary WAV file.');
+      }
     } catch (e, st) {
-      print('AudioProcessor error: $e\n$st');
+      _sendDebug('AudioProcessor error: $e\n$st');
     } finally {
       _processing = false;
+      _sendDebug('Processing finished.');
     }
   }
 
@@ -47,13 +69,15 @@ class AudioProcessor {
     final cmd =
         '-y -i "${input.replaceAll('"', '\\"')}" -ac 1 -ar $sampleRate -f wav "$out"';
 
+    _sendDebug('Running FFmpeg: $cmd');
     final sess = await FFmpegKit.execute(cmd);
     final returnCode = await sess.getReturnCode();
 
     if (returnCode != null && ReturnCode.isSuccess(returnCode)) {
+      _sendDebug('FFmpeg decode succeeded.');
       return File(out);
     } else {
-      print('FFmpeg decode failed. Code: $returnCode');
+      _sendDebug('FFmpeg decode failed. Code: $returnCode');
       return null;
     }
   }
@@ -63,10 +87,16 @@ class AudioProcessor {
     final cols = prefs.getInt('led_cols') ?? 11;
     final rows = prefs.getInt('led_rows') ?? 14;
 
+    _sendDebug('FFT cols: $cols, rows: $rows');
+
     final raf = await wavFile.open();
     const headerBytes = 44;
     final length = await wavFile.length();
-    if (length <= headerBytes) return;
+    if (length <= headerBytes) {
+      _sendDebug('WAV file too short.');
+      await raf.close();
+      return;
+    }
     await raf.setPosition(headerBytes);
     final bytes = (await raf.read(length - headerBytes)).buffer.asUint8List();
     await raf.close();
@@ -80,9 +110,10 @@ class AudioProcessor {
 
     final fft = FFT(fftSize);
     final step = fftSize;
+    int frame = 0;
     for (var i = 0; i + step <= samples.length; i += step) {
       if (_stopRequested) {
-        print('Processing stopped.');
+        _sendDebug('Processing stopped.');
         break;
       }
 
@@ -98,13 +129,16 @@ class AudioProcessor {
       final bandAmps = _binsToBands(mags, sampleRate, fftSize, cols);
       final scaled = bandAmps.map((a) => ((a / 50.0) * rows).clamp(0.0, rows.toDouble())).toList();
 
-      for (var b = 0; b < cols; b++) {
-        print('Col ${b+1}: amp ${bandAmps[b].toStringAsFixed(2)}, rows~ ${scaled[b].toStringAsFixed(2)}');
-      }
-      print('---');
+      // Send band amplitudes to UI
+      bandStreamController.add(scaled);
+
+      // Send debug info for each frame (optional, can be commented out if too verbose)
+      _sendDebug('Frame $frame: ${scaled.map((v) => v.toStringAsFixed(2)).join(", ")}');
+      frame++;
 
       await Future.delayed(const Duration(milliseconds: 1));
     }
+    _sendDebug('WAV processing complete.');
   }
 
   void _applyHanning(List<double> buf) {

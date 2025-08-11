@@ -1,10 +1,10 @@
 // lib/screens/music_player_screen.dart
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:just_audio/just_audio.dart';
+import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
-import 'dart:io';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../utils/audio_processor.dart';
@@ -28,6 +28,14 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen> {
   AudioProcessor? _processor;
   int rows = 14;
   int cols = 11;
+  final List<String> _debugLogs = [];
+
+  StreamSubscription<Duration>? _positionSub;
+  StreamSubscription<Duration>? _durationSub;
+  StreamSubscription<PlayerState>? _stateSub;
+  List<double>? bandAmplitudes;
+  StreamSubscription<List<double>>? _bandSub;
+  StreamSubscription<String>? _debugSub;
 
   @override
   void initState() {
@@ -61,10 +69,10 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen> {
         final files = await dir
             .list()
             .where((f) =>
-        f is File &&
-            (f.path.endsWith(".mp3") ||
-                f.path.endsWith(".wav") ||
-                f.path.endsWith(".m4a")))
+                f is File &&
+                (f.path.endsWith(".mp3") ||
+                    f.path.endsWith(".wav") ||
+                    f.path.endsWith(".m4a")))
             .toList();
         setState(() => musicFiles = files);
       }
@@ -75,42 +83,57 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen> {
 
   Future<void> pickFolder() async {
     String? selectedDirectory = await FilePicker.platform.getDirectoryPath();
-    if (selectedDirectory != null) await scanMusicFolder(selectedDirectory);
+    if (selectedDirectory != null) {
+      await scanMusicFolder(selectedDirectory);
+    }
   }
 
   Future<void> playMusic(String path) async {
     try {
+      await Future.delayed(const Duration(milliseconds: 200));
+      _processor?.stopProcessing();
+      _debugLogs.clear();
+
       setState(() {
         currentPlayingPath = path;
         isPlaying = true;
       });
-      await player.setFilePath(path);
 
-      // start audio processing in background (non-blocking)
-      _processor?.stopProcessing();
+      await player.stop();
+      await player.play(DeviceFileSource(path));
+
       _processor = AudioProcessor(sampleRate: 44100, fftSize: 1024);
 
-      // make sure latest settings are loaded
+      // Listen to band amplitudes
+      _bandSub?.cancel();
+      _bandSub = _processor!.bandStream.listen((bands) {
+        setState(() {
+          bandAmplitudes = bands;
+        });
+      });
+
+      // Listen to debug messages
+      _debugSub?.cancel();
+      _debugSub = _processor!.debugStream.listen((msg) {
+        setState(() {
+          _debugLogs.add(msg);
+        });
+      });
+
       final prefs = await SharedPreferences.getInstance();
       final curCols = prefs.getInt('led_cols') ?? cols;
       final curRows = prefs.getInt('led_rows') ?? rows;
-      // we only need cols for banding; rows used later for scaling if needed
       debugPrint('Starting processor with $curRows rows x $curCols cols');
 
-      // processing runs async and prints results
       unawaited(_processor!.processFileAndPrintBands(path));
-
-      await player.play();
     } catch (e) {
       _showMessage('Error playing music: $e');
-      print("Error playing music: $e");
+      debugPrint("Error playing music: $e");
     }
   }
 
   void pauseMusic() => player.pause();
-
-  void resumeMusic() => player.play();
-
+  void resumeMusic() => player.resume();
   void stopMusic() {
     player.stop();
     setState(() {
@@ -118,9 +141,15 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen> {
       isPlaying = false;
       currentPosition = Duration.zero;
       totalDuration = null;
+      bandAmplitudes = null;
     });
     _processor?.stopProcessing();
     _processor = null;
+    _bandSub?.cancel();
+    _bandSub = null;
+    _debugSub?.cancel();
+    _debugSub = null;
+    _debugLogs.clear();
   }
 
   void _showMessage(String msg) {
@@ -129,21 +158,20 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen> {
   }
 
   void _setupListeners() {
-    player.playerStateStream.listen((state) {
-      if (!mounted) return;
-      setState(() {
-        isPlaying = state.playing;
-        if (state.processingState == ProcessingState.completed) stopMusic();
-      });
-    });
-
-    player.positionStream.listen((pos) {
+    _positionSub = player.onPositionChanged.listen((pos) {
       if (!mounted) return;
       setState(() => currentPosition = pos);
     });
-    player.durationStream.listen((dur) {
+    _durationSub = player.onDurationChanged.listen((dur) {
       if (!mounted) return;
       setState(() => totalDuration = dur);
+    });
+    _stateSub = player.onPlayerStateChanged.listen((state) {
+      if (!mounted) return;
+      setState(() {
+        isPlaying = state == PlayerState.playing;
+        if (state == PlayerState.completed) stopMusic();
+      });
     });
   }
 
@@ -162,8 +190,8 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen> {
           Slider(
             value: (totalDuration != null && totalDuration!.inMilliseconds > 0)
                 ? (currentPosition.inMilliseconds /
-                totalDuration!.inMilliseconds)
-                .clamp(0.0, 1.0)
+                        totalDuration!.inMilliseconds)
+                    .clamp(0.0, 1.0)
                 : 0.0,
             onChanged: (value) {
               if (totalDuration == null) return;
@@ -228,14 +256,14 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen> {
           name,
           style: TextStyle(
               fontWeight:
-              isCurrentlySelected ? FontWeight.bold : FontWeight.normal),
+                  isCurrentlySelected ? FontWeight.bold : FontWeight.normal),
         ),
         leading: Icon(
           isCurrentlySelected && isPlaying
               ? Icons.pause_circle_filled
               : Icons.play_circle_fill,
           color:
-          isCurrentlySelected ? Theme.of(context).colorScheme.secondary : null,
+              isCurrentlySelected ? Theme.of(context).colorScheme.secondary : null,
         ),
         onTap: () {
           if (isCurrentlySelected) {
@@ -255,8 +283,49 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen> {
   @override
   void dispose() {
     _processor?.stopProcessing();
+    _positionSub?.cancel();
+    _durationSub?.cancel();
+    _stateSub?.cancel();
+    _bandSub?.cancel();
+    _debugSub?.cancel(); // Cancel the debug stream subscription
     player.dispose();
     super.dispose();
+  }
+
+  Widget _buildBandsUI() {
+    if (bandAmplitudes == null) return const SizedBox();
+    return Padding(
+      padding: const EdgeInsets.all(8.0),
+      child: Row(
+        children: bandAmplitudes!
+            .map((amp) => Expanded(
+                  child: Container(
+                    height: amp * 5, // scale for visibility
+                    color: Colors.orangeAccent,
+                    margin: const EdgeInsets.symmetric(horizontal: 2),
+                  ),
+                ))
+            .toList(),
+      ),
+    );
+  }
+
+  Widget _buildDebugLogUI() {
+    return Container(
+      color: Colors.grey[900],
+      height: 200,
+      padding: const EdgeInsets.all(8.0),
+      child: ListView.builder(
+        reverse: true, // Show the latest messages at the bottom
+        itemCount: _debugLogs.length,
+        itemBuilder: (context, index) {
+          return Text(
+            _debugLogs[_debugLogs.length - 1 - index],
+            style: const TextStyle(color: Colors.white, fontSize: 10),
+          );
+        },
+      ),
+    );
   }
 
   @override
@@ -273,16 +342,24 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen> {
             icon: const Icon(Icons.settings),
             onPressed: () async {
               await Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingPage()));
-              await _loadSettings(); // reload saved settings
+              await _loadSettings();
             },
           ),
         ],
       ),
-      body: musicFiles.isEmpty
-          ? const Center(child: Text("No music files found."))
-          : ListView.builder(
-        itemCount: musicFiles.length,
-        itemBuilder: (context, index) => buildFileTile(musicFiles[index]),
+      body: Column(
+        children: [
+          Expanded(
+            child: musicFiles.isEmpty
+                ? const Center(child: Text("No music files found."))
+                : ListView.builder(
+                    itemCount: musicFiles.length,
+                    itemBuilder: (context, index) => buildFileTile(musicFiles[index]),
+                  ),
+          ),
+          _buildBandsUI(),
+          _buildDebugLogUI(), // <-- New widget to display the debug logs
+        ],
       ),
       bottomNavigationBar: _buildMiniPlayer(),
     );
