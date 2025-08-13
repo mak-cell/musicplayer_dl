@@ -26,7 +26,7 @@ android {
 
     defaultConfig {
         applicationId = "com.wiprodlc.musicplayer"
-        minSdk = localProperties.getProperty("flutter.minSdkVersion").toInt()
+        minSdk = 24
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
