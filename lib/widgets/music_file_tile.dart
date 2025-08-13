@@ -11,7 +11,7 @@ class MusicFileTile extends StatelessWidget {
   final VoidCallback onPause;
   final VoidCallback onResume;
 
-  MusicFileTile({
+  const MusicFileTile({super.key, 
     required this.file,
     required this.currentPlayingPath,
     required this.isPlaying,
